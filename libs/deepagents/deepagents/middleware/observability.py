@@ -19,18 +19,20 @@ from langchain.tools.tool_node import ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
-from deepagents.observability import LANGFUSE_ENABLED, langfuse_context, observe, update_current_observation
+from deepagents.observability import LANGFUSE_ENABLED, _safe_call, langfuse_context, observe, update_current_observation
 
 _DEFAULT_MAX_ARG_CHARS = 2000
 _DEFAULT_MAX_OUTPUT_CHARS = 2000
 _DEFAULT_MAX_MESSAGES = 6
 _LANGFUSE_PARENT_KEY = "_langfuse_parent"
+_LANGFUSE_AGENT_PARENT_KEY = "_langfuse_agent_parent"
 
 
 class LangfuseState(AgentState):
     """State for Langfuse tracing middleware (private parent span linkage)."""
 
     _langfuse_parent: Annotated[NotRequired[dict[str, str]], PrivateStateAttr]
+    _langfuse_agent_parent: Annotated[NotRequired[dict[str, str]], PrivateStateAttr]
 
 
 def _truncate_repr(value: Any, limit: int) -> str:
@@ -166,11 +168,11 @@ def _get_langfuse_trace_context() -> dict[str, str] | None:
     return None
 
 
-def _get_parent_from_runtime(runtime: Any) -> dict[str, str] | None:
+def _get_parent_from_runtime(runtime: Any, *, key: str = _LANGFUSE_PARENT_KEY) -> dict[str, str] | None:
     state = getattr(runtime, "state", None)
     if not isinstance(state, Mapping):
         return None
-    parent = state.get(_LANGFUSE_PARENT_KEY)
+    parent = state.get(key)
     if not isinstance(parent, dict):
         return None
     trace_id = parent.get("trace_id")
@@ -268,6 +270,74 @@ def _summarize_model_response(response: ModelResponse[Any], max_chars: int) -> d
     return summary
 
 
+def _extract_response_message(response: ModelResponse[Any]) -> Any:
+    """Extract the AIMessage from a ModelResponse."""
+    message = getattr(response, "message", None)
+    if message is None:
+        messages = getattr(response, "messages", None)
+        if isinstance(messages, list) and messages:
+            message = messages[-1]
+    return message
+
+
+def _extract_usage_metadata(message: Any) -> dict[str, int]:
+    """Extract token usage from a LangChain AIMessage."""
+    usage: dict[str, int] = {}
+    if message is None:
+        return usage
+    # LangChain standard: message.usage_metadata (TypedDict with input_tokens, output_tokens, total_tokens)
+    usage_meta = getattr(message, "usage_metadata", None)
+    if isinstance(usage_meta, dict):
+        for key in ("input_tokens", "output_tokens", "total_tokens"):
+            val = usage_meta.get(key)
+            if isinstance(val, (int, float)):
+                usage[key] = int(val)
+    # Fallback: message.response_metadata.token_usage (OpenAI-style)
+    if not usage:
+        resp_meta = getattr(message, "response_metadata", None)
+        if isinstance(resp_meta, dict):
+            token_usage = resp_meta.get("token_usage") or resp_meta.get("usage")
+            if isinstance(token_usage, dict):
+                _openai_to_langfuse = {
+                    "prompt_tokens": "input_tokens",
+                    "completion_tokens": "output_tokens",
+                    "total_tokens": "total_tokens",
+                }
+                for src, dst in _openai_to_langfuse.items():
+                    val = token_usage.get(src)
+                    if isinstance(val, (int, float)):
+                        usage[dst] = int(val)
+    return usage
+
+
+def _extract_model_name_from_response(request: ModelRequest[Any], message: Any) -> str | None:
+    """Extract model name from request model object or response metadata."""
+    # From request.model
+    model = getattr(request, "model", None)
+    if model is not None:
+        for attr in ("model_name", "model", "model_id"):
+            name = getattr(model, attr, None)
+            if isinstance(name, str) and name:
+                return name
+    # From response metadata
+    if message is not None:
+        resp_meta = getattr(message, "response_metadata", None)
+        if isinstance(resp_meta, dict):
+            name = resp_meta.get("model_name") or resp_meta.get("model")
+            if isinstance(name, str) and name:
+                return name
+    return None
+
+
+def _update_generation_metadata(**kwargs: Any) -> None:
+    """Update the current Langfuse GENERATION observation with model/usage info."""
+    updater = getattr(langfuse_context, "update_current_generation", None)
+    if not callable(updater):
+        # Fallback to generic span update (loses generation-specific fields but won't crash)
+        updater = getattr(langfuse_context, "update_current_span", None)
+    _safe_call(updater, **kwargs)
+
+
 class LangfuseTracingMiddleware(AgentMiddleware[LangfuseState, ContextT, ResponseT]):
     """Trace tool calls and agent turns to Langfuse when configured."""
 
@@ -324,7 +394,12 @@ class LangfuseTracingMiddleware(AgentMiddleware[LangfuseState, ContextT, Respons
             update_current_observation(output=_summarize_tool_result(result, self._max_output_chars))
             return result
 
-        parent = _get_parent_from_runtime(request.runtime)
+        # Use the agent-level parent so tool spans are siblings of agent.generation,
+        # not children.  Fall back to the generation-level parent for subagent contexts
+        # (inside a Task call the agent_parent may not be set yet).
+        parent = _get_parent_from_runtime(request.runtime, key=_LANGFUSE_AGENT_PARENT_KEY)
+        if parent is None:
+            parent = _get_parent_from_runtime(request.runtime)
         return _run(**_build_langfuse_parent_kwargs(parent))
 
     def wrap_model_call(
@@ -335,7 +410,16 @@ class LangfuseTracingMiddleware(AgentMiddleware[LangfuseState, ContextT, Respons
         if not self._should_trace():
             return handler(request)
 
-        @observe(name="agent.turn")
+        # Capture the agent-level parent (i.e. the span that owns the full agent run,
+        # e.g. agent.root-cause-verifier.run) BEFORE entering the generation span.
+        # This allows tool spans to be reparented as siblings of the generation span.
+        agent_parent = _get_parent_from_runtime(request.runtime, key=_LANGFUSE_AGENT_PARENT_KEY)
+        if agent_parent is None:
+            # First turn — no agent parent stored yet.  Grab whatever is current
+            # (will be the outer agent.run span created by DeepSleep).
+            agent_parent = _get_langfuse_trace_context()
+
+        @observe(name="agent.generation", as_type="generation")
         def _run() -> ModelResponse[ResponseT] | ExtendedModelResponse[ResponseT]:
             update_current_observation(input=_summarize_model_request(request, self._max_arg_chars))
             try:
@@ -350,10 +434,29 @@ class LangfuseTracingMiddleware(AgentMiddleware[LangfuseState, ContextT, Respons
                 raise
             model_response, existing_command = _split_model_response(response)
             update_current_observation(output=_summarize_model_response(model_response, self._max_output_chars))
-            parent = _get_langfuse_trace_context()
-            if parent is None:
+
+            # Write model name and token usage to the GENERATION span.
+            message = _extract_response_message(model_response)
+            gen_kwargs: dict[str, Any] = {}
+            model_name = _extract_model_name_from_response(request, message)
+            if model_name:
+                gen_kwargs["model"] = model_name
+            usage = _extract_usage_metadata(message)
+            if usage:
+                gen_kwargs["usage_details"] = usage
+            if gen_kwargs:
+                _update_generation_metadata(**gen_kwargs)
+
+            # Store parent context for downstream tool spans and subagent linkage.
+            # _LANGFUSE_PARENT_KEY  → this generation span (used by subagents as their parent)
+            # _LANGFUSE_AGENT_PARENT_KEY → the outer agent.run span (used by tool spans as sibling parent)
+            generation_parent = _get_langfuse_trace_context()
+            if generation_parent is None:
                 return response
-            merged_command = _merge_command(existing_command, {_LANGFUSE_PARENT_KEY: parent})
+            state_update: dict[str, Any] = {_LANGFUSE_PARENT_KEY: generation_parent}
+            if agent_parent is not None:
+                state_update[_LANGFUSE_AGENT_PARENT_KEY] = agent_parent
+            merged_command = _merge_command(existing_command, state_update)
             return ExtendedModelResponse(
                 model_response=model_response,
                 command=merged_command,
@@ -396,7 +499,9 @@ class LangfuseTracingMiddleware(AgentMiddleware[LangfuseState, ContextT, Respons
             update_current_observation(output=_summarize_tool_result(result, self._max_output_chars))
             return result
 
-        parent = _get_parent_from_runtime(request.runtime)
+        parent = _get_parent_from_runtime(request.runtime, key=_LANGFUSE_AGENT_PARENT_KEY)
+        if parent is None:
+            parent = _get_parent_from_runtime(request.runtime)
         return await _run(**_build_langfuse_parent_kwargs(parent))
 
     async def awrap_model_call(
@@ -407,7 +512,11 @@ class LangfuseTracingMiddleware(AgentMiddleware[LangfuseState, ContextT, Respons
         if not self._should_trace():
             return await handler(request)
 
-        @observe(name="agent.turn")
+        agent_parent = _get_parent_from_runtime(request.runtime, key=_LANGFUSE_AGENT_PARENT_KEY)
+        if agent_parent is None:
+            agent_parent = _get_langfuse_trace_context()
+
+        @observe(name="agent.generation", as_type="generation")
         async def _run() -> ModelResponse[ResponseT] | ExtendedModelResponse[ResponseT]:
             update_current_observation(input=_summarize_model_request(request, self._max_arg_chars))
             try:
@@ -422,10 +531,25 @@ class LangfuseTracingMiddleware(AgentMiddleware[LangfuseState, ContextT, Respons
                 raise
             model_response, existing_command = _split_model_response(response)
             update_current_observation(output=_summarize_model_response(model_response, self._max_output_chars))
-            parent = _get_langfuse_trace_context()
-            if parent is None:
+
+            message = _extract_response_message(model_response)
+            gen_kwargs: dict[str, Any] = {}
+            model_name = _extract_model_name_from_response(request, message)
+            if model_name:
+                gen_kwargs["model"] = model_name
+            usage = _extract_usage_metadata(message)
+            if usage:
+                gen_kwargs["usage_details"] = usage
+            if gen_kwargs:
+                _update_generation_metadata(**gen_kwargs)
+
+            generation_parent = _get_langfuse_trace_context()
+            if generation_parent is None:
                 return response
-            merged_command = _merge_command(existing_command, {_LANGFUSE_PARENT_KEY: parent})
+            state_update: dict[str, Any] = {_LANGFUSE_PARENT_KEY: generation_parent}
+            if agent_parent is not None:
+                state_update[_LANGFUSE_AGENT_PARENT_KEY] = agent_parent
+            merged_command = _merge_command(existing_command, state_update)
             return ExtendedModelResponse(
                 model_response=model_response,
                 command=merged_command,
