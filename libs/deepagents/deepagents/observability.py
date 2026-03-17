@@ -73,14 +73,29 @@ if _is_langfuse_configured():
 
 
 def update_current_observation(**kwargs: Any) -> None:
-    """Update the current Langfuse observation with additional metadata."""
+    """Update the current Langfuse observation with additional metadata.
+
+    Langfuse's Python SDK exposes this functionality as `update_current_span(...)`.
+    Older integrations used `update_current_observation(...)`. We support both.
+    """
     updater = getattr(langfuse_context, "update_current_observation", None)
+    if not callable(updater):
+        updater = getattr(langfuse_context, "update_current_span", None)
     _safe_call(updater, **kwargs)
 
 
 def update_current_trace(**kwargs: Any) -> None:
-    """Update the current Langfuse trace with additional metadata."""
+    """Update the current Langfuse trace with additional metadata.
+
+    Langfuse's Python SDK no longer exposes `update_current_trace(...)` as a public
+    method. Trace-level attributes should be set via `langfuse.propagate_attributes(...)`.
+
+    This function is kept for backwards compatibility; when possible it maps to
+    `set_current_trace_io(...)` (legacy) or becomes a no-op.
+    """
     updater = getattr(langfuse_context, "update_current_trace", None)
+    if not callable(updater):
+        updater = getattr(langfuse_context, "set_current_trace_io", None)
     _safe_call(updater, **kwargs)
 
 
