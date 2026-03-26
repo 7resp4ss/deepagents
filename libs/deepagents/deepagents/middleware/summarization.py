@@ -191,7 +191,7 @@ def compute_summarization_defaults(model: BaseChatModel) -> SummarizationDefault
     # Defaults for models without profile info are more conservative to avoid
     # overshooting context limits.
     return {
-        "trigger": ("tokens", 170000),
+        "trigger": ("tokens", 400000),
         "keep": ("messages", 6),
         "truncate_args_settings": {
             "trigger": ("messages", 20),

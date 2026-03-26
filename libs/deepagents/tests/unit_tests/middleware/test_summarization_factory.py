@@ -36,7 +36,7 @@ def test_factory_uses_fallback_defaults_without_profile() -> None:
     model = _make_model(with_profile_limit=None)
     middleware = create_summarization_middleware(model, cast("Any", MagicMock()))
 
-    assert middleware._lc_helper.trigger == ("tokens", 170000)
+    assert middleware._lc_helper.trigger == ("tokens", 400000)
     assert middleware._lc_helper.keep == ("messages", 6)
     assert middleware._truncate_args_trigger == ("messages", 20)
     assert middleware._truncate_args_keep == ("messages", 20)
